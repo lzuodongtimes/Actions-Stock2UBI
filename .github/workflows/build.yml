@@ -1,1 +1,105 @@
+name: Build AN758x-Stock2UBI
 
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build.yml'
+  schedule:
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: https://github.com/pbs05/an758x-stock2ubi.git
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-24.04
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+    steps:
+      - name: Check pbs05/an758x-stock2ubi updates
+        id: check
+        run: |
+          UPSTREAM_SHA=$(git ls-remote "$UPSTREAM_REPO" HEAD | awk '{print $1}')
+          echo "Latest an758x-stock2ubi HEAD: $UPSTREAM_SHA"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+          LAST_SHA=$(gh release list --repo "${{ github.repository }}" --limit 10 --json tagName,body \
+            | jq -r '.[] | select(.tagName | startswith("stock2ubi-v")) | .body' \
+            | grep -oE 'upstream_sha:[[:space:]]*[0-9a-f]{40}' | head -n1 | awk '{print $2}' || true)
+          echo "Last built upstream SHA: ${LAST_SHA:-none}"
+
+          if [ "${{ github.event_name }}" != "schedule" ] || [ -z "$LAST_SHA" ] || [ "$UPSTREAM_SHA" != "$LAST_SHA" ]; then
+            SHOULD_BUILD="true"
+          else
+            SHOULD_BUILD="false"
+          fi
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          if [ "$SHOULD_BUILD" = "false" ]; then
+            echo "上游未更新，跳过编译。"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: check-upstream
+    if: ${{ needs.check-upstream.outputs.should_build == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Clone stock2ubi
+        run: |
+          git clone --depth=1 "$UPSTREAM_REPO" /tmp/s2u
+          git -C /tmp/s2u log -1 --oneline
+
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-unknown-linux-musl
+          rustup default stable
+          rustc -Vv
+          cargo -V
+
+      - name: Cross-build (aarch64 musl)
+        run: |
+          cd /tmp/s2u
+          cargo build --locked --release --target aarch64-unknown-linux-musl
+          ls -la target/aarch64-unknown-linux-musl/release/an758x-stock2ubi
+          file target/aarch64-unknown-linux-musl/release/an758x-stock2ubi
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: an758x-stock2ubi-aarch64
+          path: /tmp/s2u/target/aarch64-unknown-linux-musl/release/an758x-stock2ubi
+          if-no-files-found: error
+
+  release:
+    needs: [check-upstream, build]
+    if: ${{ needs.check-upstream.outputs.should_build == 'true' && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: an758x-stock2ubi-aarch64
+          path: release
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: stock2ubi-v${{ github.run_number }}
+          name: AN758x-Stock2UBI Build #${{ github.run_number }}
+          body: |
+            Automated build for pbs05/an758x-stock2ubi
+            upstream_sha: ${{ needs.check-upstream.outputs.upstream_sha }}
+          files: release/an758x-stock2ubi
+          fail-on-unmatched-files: false
+
+      - name: Clean up
+        if: always()
+        run: |
+          rm -rf release || true
